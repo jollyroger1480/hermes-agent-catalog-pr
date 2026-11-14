@@ -125,19 +125,86 @@ def test_zero_event_retry_prunes_oversized_tool_output_and_logs_size_delta(monke
     assert re.search(r"serialized_input_bytes=\d+ -> \d+", prune_logs[0])
 
 
-def test_zero_event_retry_without_prunable_output_logs_unchanged_resend(monkeypatch, caplog):
-    from tests.agent.test_run_agent_codex_responses import _build_agent
+def test_zero_event_retry_spills_oversized_user_text(monkeypatch, tmp_path, caplog):
+    """User text over the turn budget is the same class as an oversized tool result.
 
+    A non-string tool output used to log ``resending payload unchanged`` and
+    reconnect with the same multi-hundred-kilobyte body.
+    """
+    from tests.agent.test_run_agent_codex_responses import _build_agent
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path, raising=False)
     agent = _build_agent(monkeypatch)
     seen: list = []
     agent.client = _zero_event_then_completed_client(seen)
     kwargs = _oversized_codex_kwargs(300_000)
-    kwargs["input"][2]["output"] = ["not-a-string"]  # nothing prunable
-    kwargs["input"][0]["content"] = "u" * 300_000  # still a large payload
+    kwargs["input"][2]["output"] = ["not-a-string"]
+    kwargs["input"][0]["content"] = "u" * 300_000
 
     with caplog.at_level(logging.INFO, logger="agent.codex_runtime"):
         response = agent._run_codex_stream(kwargs)
 
-    assert response.status == "completed" and seen[0] == seen[1]
+    assert response.status == "completed" and seen[0] != seen[1]
+    first, second = (len(json.dumps(i)) for i in seen)
+    assert second < first
+    assert PERSISTED_OUTPUT_TAG in seen[1][0]["content"]
+    assert seen[0][0]["content"] == "u" * 300_000
     (log,) = [r.message for r in caplog.records if "zero-event" in r.message]
-    assert "unchanged" in log and "attempt 1/2" in log and re.search(r"serialized_input_bytes=\d+", log)
+    assert "unchanged" not in log and "attempt 1/2" in log
+    assert re.search(r"serialized_input_bytes=\d+ -> \d+", log)
+
+
+def test_prune_leaves_under_budget_payload_untouched():
+    from agent.codex_runtime import _prune_zero_event_retry_payload
+
+    kwargs = {"model": "grok-4.7", "input": [{"role": "user", "content": "short"}]}
+    assert _prune_zero_event_retry_payload(kwargs, 1, 2) is kwargs
+
+
+def test_prune_spills_tool_output_and_user_text_without_mutating_caller(tmp_path, monkeypatch):
+    """Over-budget text is spilled whether it sits in a tool result or a user turn.
+
+    Pieces under the per-result cap still count: five 50k user turns are over the
+    turn budget and must not be resent whole.
+    """
+    from agent.codex_runtime import _prune_zero_event_retry_payload
+    from tools.budget_config import DEFAULT_BUDGET
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path, raising=False)
+    tool_output = "x" * 160_000
+    user_text = "u" * 50_000
+    original = [{"role": "user", "content": user_text} for _ in range(5)]
+    original.append({"type": "function_call_output", "call_id": "call_browser", "output": tool_output})
+    kwargs = {"model": "grok-4.7", "input": original}
+    out = _prune_zero_event_retry_payload(kwargs, 1, 2)
+    assert original[0]["content"] == user_text
+    assert original[-1]["output"] == tool_output
+    assert PERSISTED_OUTPUT_TAG in out["input"][-1]["output"]
+    assert Path(tmp_path, "cache", "spillover", "call_browser.txt").read_text() == tool_output
+    assert _serialized_retry_bytes(out["input"]) <= DEFAULT_BUDGET.turn_budget
+
+
+def _serialized_retry_bytes(items) -> int:
+    return len(json.dumps(items, default=str).encode("utf-8"))
+
+
+def test_prune_spills_user_text_when_no_tool_output_is_a_string(tmp_path, monkeypatch):
+    from agent.codex_runtime import _prune_zero_event_retry_payload
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path, raising=False)
+    user_text = "u" * 300_000
+    original = [
+        {"role": "user", "content": user_text},
+        {"type": "function_call_output", "call_id": "call_browser", "output": ["not-a-string"]},
+    ]
+    kwargs = {"model": "grok-4.7", "input": original}
+    out = _prune_zero_event_retry_payload(kwargs, 1, 2)
+    assert original[0]["content"] == user_text
+    assert PERSISTED_OUTPUT_TAG in out["input"][0]["content"]
+    assert len(out["input"][0]["content"]) < 10_000

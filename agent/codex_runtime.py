@@ -83,40 +83,157 @@ def _codex_request_failure_details(error: BaseException) -> tuple[int | None, st
     return request_body_bytes, " <- ".join(exception_classes)
 
 
-def _prune_zero_event_retry_payload(api_kwargs: dict, attempt: int, attempts: int) -> dict:
-    """#95429 criterion 3: a reconnect after an attempt that produced no stream event must not resend
-    a pathological payload unchanged. Inline ``function_call_output`` strings over the per-result
-    threshold (results that escaped commit-time persistence) are spilled through the standard
-    policy -- bounded preview + recoverable ``<persisted-output>`` reference -- and ONE log line
-    records the size delta. When nothing is prunable the resend is logged as unchanged. The
-    caller's kwargs are never mutated; only the retried wire payload changes."""
+def _serialized_input_bytes(items: list) -> int:
+    return len(json.dumps(items, default=str).encode("utf-8"))
+
+
+def _spill_inline_text(text: str, tool_use_id: str, threshold: float) -> str:
+    """Persist one oversized inline string. Short text and text already spilled stay put."""
     from tools.budget_config import DEFAULT_BUDGET
-    from tools.tool_result_storage import maybe_persist_tool_result
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG, maybe_persist_tool_result
+
+    if PERSISTED_OUTPUT_TAG in text or (threshold != 0 and len(text) <= threshold):
+        return text
+    return maybe_persist_tool_result(
+        content=text, tool_name="codex_zero_event_retry", tool_use_id=tool_use_id,
+        config=DEFAULT_BUDGET, threshold=threshold,
+    )
+
+
+def _spill_node(node: Any, tool_use_id: str, threshold: float) -> tuple[Any, int]:
+    """Copy *node*, spilling oversized strings. Returns ``(copy_or_same, spill_count)``."""
+    if isinstance(node, str):
+        replaced = _spill_inline_text(node, tool_use_id, threshold)
+        return replaced, int(replaced != node)
+    if isinstance(node, list):
+        copied, spills = list(node), 0
+        for index, child in enumerate(node):
+            new_child, count = _spill_node(child, f"{tool_use_id}_{index}", threshold)
+            if count:
+                copied[index] = new_child
+                spills += count
+        return (copied, spills) if spills else (node, 0)
+    if isinstance(node, dict):
+        copied, spills = dict(node), 0
+        for key, child in node.items():
+            new_child, count = _spill_node(child, f"{tool_use_id}_{key}", threshold)
+            if count:
+                copied[key] = new_child
+                spills += count
+        return (copied, spills) if spills else (node, 0)
+    return node, 0
+
+
+def _largest_unspilled_string(node: Any, path: tuple = ()) -> tuple[int, tuple] | None:
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    best: tuple[int, tuple] | None = None
+    if isinstance(node, str):
+        if PERSISTED_OUTPUT_TAG not in node:
+            best = (len(node), path)
+    elif isinstance(node, list):
+        for index, child in enumerate(node):
+            hit = _largest_unspilled_string(child, path + (("list", index),))
+            if hit and (best is None or hit[0] > best[0]):
+                best = hit
+    elif isinstance(node, dict):
+        for key, child in node.items():
+            hit = _largest_unspilled_string(child, path + (("dict", key),))
+            if hit and (best is None or hit[0] > best[0]):
+                best = hit
+    return best
+
+
+def _replace_at(node: Any, path: tuple, value: str) -> Any:
+    if not path:
+        return value
+    kind, key = path[0]
+    if kind == "list":
+        copied = list(node)
+        copied[key] = _replace_at(node[key], path[1:], value)
+        return copied
+    copied = dict(node)
+    copied[key] = _replace_at(node[key], path[1:], value)
+    return copied
+
+
+def _drop_paired_call(items: list, removed: Any) -> list:
+    """Drop the matching function call or output so a retry does not orphan one side."""
+    if not isinstance(removed, dict):
+        return items
+    call_id = removed.get("call_id")
+    kind = removed.get("type")
+    if not call_id or kind not in {"function_call", "function_call_output"}:
+        return items
+    other = "function_call_output" if kind == "function_call" else "function_call"
+    return [item for item in items if not (
+        isinstance(item, dict) and item.get("type") == other and item.get("call_id") == call_id
+    )]
+
+
+def _prune_zero_event_retry_payload(api_kwargs: dict, attempt: int, attempts: int) -> dict:
+    """A reconnect after a zero-event attempt must not resend an over-budget payload unchanged.
+
+    Inline tool output is one source. User and assistant text that never went through
+    tool persistence is the same class: the 2026-11-09 stall resent 2,083,043 bytes
+    because no ``function_call_output`` string was over the per-result cap. Spill every
+    oversized string, then the largest remaining strings, until the turn is under budget.
+    The caller's kwargs are never mutated.
+    """
+    from tools.budget_config import DEFAULT_BUDGET
 
     items = api_kwargs.get("input")
     if not isinstance(items, list):
         return api_kwargs
-    before = len(json.dumps(items, default=str).encode("utf-8"))
+    before = _serialized_input_bytes(items)
     if before <= DEFAULT_BUDGET.turn_budget:
         return api_kwargs
-    pruned_items, pruned = [], 0
-    for item in items:
-        output = item.get("output") if isinstance(item, dict) and item.get("type") == "function_call_output" else None
-        if isinstance(output, str):
-            replaced = maybe_persist_tool_result(content=output, tool_name="codex_zero_event_retry",
-                                                 tool_use_id=str(item.get("call_id") or "call"),
-                                                 config=DEFAULT_BUDGET, threshold=DEFAULT_BUDGET.default_result_size)
-            if replaced != output:
-                item, pruned = {**item, "output": replaced}, pruned + 1
-        pruned_items.append(item)
-    if not pruned:
-        logger.warning("Codex zero-event retry (attempt %s/%s): no prunable tool output; resending payload "
-                       "unchanged (serialized_input_bytes=%s, model=%s)", attempt, attempts, before, api_kwargs.get("model"))
-        return api_kwargs
-    after = len(json.dumps(pruned_items, default=str).encode("utf-8"))
-    logger.warning("Codex zero-event retry (attempt %s/%s): spilled %d oversized tool output(s) before reconnect, "
-                   "serialized_input_bytes=%s -> %s (model=%s)", attempt, attempts, pruned, before, after,
-                   api_kwargs.get("model"))
+    pruned_items: list = []
+    pruned = 0
+    for index, item in enumerate(items):
+        if isinstance(item, dict) and item.get("type") == "function_call_output" and isinstance(item.get("output"), str):
+            replaced = _spill_inline_text(
+                item["output"], str(item.get("call_id") or "call"), DEFAULT_BUDGET.default_result_size,
+            )
+            if replaced != item["output"]:
+                item = {**item, "output": replaced}
+                pruned += 1
+        spilled, count = _spill_node(item, f"item{index}", DEFAULT_BUDGET.default_result_size)
+        pruned += count
+        pruned_items.append(spilled)
+    for _ in range(32):
+        if _serialized_input_bytes(pruned_items) <= DEFAULT_BUDGET.turn_budget:
+            break
+        largest = _largest_unspilled_string(pruned_items)
+        if largest is None or largest[0] <= DEFAULT_BUDGET.preview_size:
+            break
+        _length, path = largest
+        current = pruned_items
+        for kind, key in path:
+            current = current[key]
+        replaced = _spill_inline_text(current, f"shrink_{len(path)}_{_length}", 0)
+        if len(replaced) >= len(current):
+            break
+        pruned_items = _replace_at(pruned_items, path, replaced)
+        pruned += 1
+    while (
+        len(pruned_items) > 1
+        and _serialized_input_bytes(pruned_items) > DEFAULT_BUDGET.turn_budget
+    ):
+        removed = pruned_items.pop(0)
+        pruned_items = _drop_paired_call(pruned_items, removed)
+        pruned += 1
+    after = _serialized_input_bytes(pruned_items)
+    if after >= before:
+        raise RuntimeError(
+            "Codex zero-event retry refused: payload is over the turn budget and could not be "
+            f"reduced (serialized_input_bytes={before}, model={api_kwargs.get('model')})"
+        )
+    logger.warning(
+        "Codex zero-event retry (attempt %s/%s): spilled %d oversized inline text(s) before reconnect, "
+        "serialized_input_bytes=%s -> %s (model=%s)",
+        attempt, attempts, pruned, before, after, api_kwargs.get("model"),
+    )
     return {**api_kwargs, "input": pruned_items}
 
 
